@@ -1,0 +1,22 @@
+# /etc/systemd/system/vdlbot.service — запуск без Docker
+[Unit]
+Description=Telegram video downloader bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vdlbot
+WorkingDirectory=/opt/vdlbot
+EnvironmentFile=/opt/vdlbot/.env
+ExecStart=/opt/vdlbot/.venv/bin/python -m bot.main
+Restart=always
+RestartSec=5
+# немного изоляции
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DOWNLOAD_DIR: /tmp/vdlbot
+    volumes:
+      # раскомментируйте, если используете cookies (и укажите COOKIES_FILE=/app/cookies.txt в .env)
+      # - ./cookies.txt:/app/cookies.txt:ro
+      - dl-tmp:/tmp/vdlbot
+    tmpfs:
+      - /tmp:size=64m
+
+volumes:
+  dl-tmp:

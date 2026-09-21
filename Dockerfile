@@ -15,7 +15,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot ./bot
 
-RUN useradd -m -u 10001 botuser && mkdir -p /tmp/vdlbot && chown -R botuser /tmp/vdlbot
+ENV DB_PATH=/data/vdlbot.sqlite3
+
+RUN useradd -m -u 10001 botuser && mkdir -p /tmp/vdlbot /data && chown -R botuser /tmp/vdlbot /data
 USER botuser
 
 CMD ["python", "-m", "bot.main"]

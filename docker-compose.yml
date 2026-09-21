@@ -5,12 +5,19 @@ services:
     env_file: .env
     environment:
       DOWNLOAD_DIR: /tmp/vdlbot
+    # публичные резолверы: лечит "No address associated with hostname",
+    # когда DNS хоста не отдаёт адрес площадки
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     volumes:
       # раскомментируйте, если используете cookies (и укажите COOKIES_FILE=/app/cookies.txt в .env)
       # - ./cookies.txt:/app/cookies.txt:ro
       - dl-tmp:/tmp/vdlbot
+      - db:/data
     tmpfs:
       - /tmp:size=64m
 
 volumes:
   dl-tmp:
+  db:

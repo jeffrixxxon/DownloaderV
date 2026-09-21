@@ -1,63 +1,75 @@
-"""Антиспам ибелый список пользователей."""
+"""Очередь загрузок: ограничивает параллелизм и число задач на пользователя."""
 from __future__ import annotations
 
-import time
+import asyncio
+import logging
+from collections import defaultdict
 from collections.abc import Awaitable, Callable
-from typing import Any
-
-from aiogram import BaseMiddleware
-from aiogram.types import CallbackQuery, Message, TelegramObject, User
 
 from .config import config
 
-
-class AccessMiddleware(BaseMiddleware):
-    """Если задан ALLOWED_USERS — пускает только их."""
-
-    async def __call__(
-        self,
-        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
-        event: TelegramObject,
-        data: dict[str, Any],
-    ) -> Any:
-        if not config.allowed_users:
-            return await handler(event, data)
-        user: User | None = data.get("event_from_user")
-        if user and user.id in config.allowed_users:
-            return await handler(event, data)
-        if isinstance(event, CallbackQuery):
-            await event.answer("Нет доступа к этому боту.", show_alert=True)
-        return None
+log = logging.getLogger(__name__)
 
 
-class ThrottleMiddleware(BaseMiddleware):
-    """Не чаще одного «тяжёлого» действия раз в config.user_cooldown секунд."""
+class QueueFull(Exception):
+    """У пользователя уже слишком много задач в работе."""
 
-    def __init__(self) -> None:
-        self._last: dict[int, float] = {}
 
-    async def __call__(
-        self,
-        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
-        event: TelegramObject,
-        data: dict[str, Any],
-    ) -> Any:
-        user: User | None = data.get("event_from_user")
-        if user is None or config.user_cooldown <= 0:
-            return await handler(event, data)
+class JobQueue:
+    def __init__(self, workers: int, per_user_limit: int) -> None:
+        self._queue: asyncio.Queue[tuple[int, Callable[[], Awaitable[None]]]] = asyncio.Queue()
+        self._workers_count = max(1, workers)
+        self._per_user_limit = max(1, per_user_limit)
+        self._per_user: dict[int, int] = defaultdict(int)
+        self._tasks: list[asyncio.Task[None]] = []
 
-        now = time.monotonic()
-        last = self._last.get(user.id, 0.0)
-        wait = config.user_cooldown - (now - last)
-        if wait > 0:
-            if isinstance(event, CallbackQuery):
-                await event.answer(f"Слишком часто. Подождите {wait:.0f} с.", show_alert=False)
-            elif isinstance(event, Message):
-                await event.reply(f"Слишком часто. Подождите {wait:.0f} с.")
-            return None
+    # -- жизненный цикл ----------------------------------------------------- #
 
-        self._last[user.id] = now
-        if len(self._last) > 10_000:  # защита от роста словаря
-            cutoff = now - config.user_cooldown * 10
-            self._last = {uid: ts for uid, ts in self._last.items() if ts > cutoff}
-        return await handler(event, data)
+    def start(self) -> None:
+        if self._tasks:
+            return
+        self._tasks = [
+            asyncio.create_task(self._worker(i), name=f"dl-worker-{i}")
+            for i in range(self._workers_count)
+        ]
+        log.info("Запущено воркеров загрузки: %s", self._workers_count)
+
+    async def stop(self) -> None:
+        for task in self._tasks:
+            task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
+
+    # -- API ---------------------------------------------------------------- #
+
+    def submit(self, user_id: int, job: Callable[[], Awaitable[None]]) -> int:
+        """Ставит задачу в очередь. Возвращает позицию (0 = сразу в работу)."""
+        if self._per_user[user_id] >= self._per_user_limit:
+            raise QueueFull
+        self._per_user[user_id] += 1
+        self._queue.put_nowait((user_id, job))
+        return max(0, self._queue.qsize() - self._workers_count)
+
+    @property
+    def pending(self) -> int:
+        return self._queue.qsize()
+
+    # -- внутреннее --------------------------------------------------------- #
+
+    async def _worker(self, index: int) -> None:
+        while True:
+            user_id, job = await self._queue.get()
+            try:
+                await job()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                log.exception("Воркер %s: задача упала", index)
+            finally:
+                self._per_user[user_id] = max(0, self._per_user[user_id] - 1)
+                if self._per_user[user_id] == 0:
+                    self._per_user.pop(user_id, None)
+                self._queue.task_done()
+
+
+job_queue = JobQueue(config.max_concurrent, config.max_user_queue)

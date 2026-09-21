@@ -13,7 +13,9 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.types import BotCommand
 
+from . import storage
 from .config import config
+from .donate import router as donate_router
 from .handlers import router
 from .middlewares import AccessMiddleware, ThrottleMiddleware
 from .queue import job_queue
@@ -32,12 +34,18 @@ def _check_binaries() -> None:
 
 
 async def _on_startup(bot: Bot) -> None:
+    await storage.init()
     job_queue.start()
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="Начало работы"),
             BotCommand(command="help", description="Справка"),
             BotCommand(command="status", description="Очередь загрузок"),
+            *(
+                [BotCommand(command="donate", description="Поддержать автора")]
+                if config.donate_enabled
+                else []
+            ),
         ]
     )
     me = await bot.get_me()
@@ -70,6 +78,9 @@ async def main() -> None:
     # кулдаун вешаем только на входящие сообщения: нажатие кнопки качества идёт
     # сразу после ссылки, и троттлить его было бы неудобно — там работает лимит очереди
     dp.message.middleware(ThrottleMiddleware())
+    # донаты подключаем первым: у них свои типы апдейтов (платежи)
+    if config.donate_enabled:
+        dp.include_router(donate_router)
     dp.include_router(router)
     dp.startup.register(_on_startup)
     dp.shutdown.register(_on_shutdown)

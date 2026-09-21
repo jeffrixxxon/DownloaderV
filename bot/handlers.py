@@ -21,7 +21,6 @@ from aiogram.types import (
 from . import texts
 from .config import config
 from .downloader import (
-    PLATFORM_TITLES,
     DownloadFailed,
     MediaInfo,
     cleanup,
@@ -29,7 +28,9 @@ from .downloader import (
     extract_links,
     probe,
 )
+from .donate import hint_keyboard
 from .queue import QueueFull, job_queue
+from . import storage
 
 log = logging.getLogger(__name__)
 router = Router(name="main")
@@ -88,7 +89,7 @@ def _keyboard(token: str, info: MediaInfo) -> InlineKeyboardMarkup:
 
 def _card(info: MediaInfo) -> str:
     parts = [f"<b>{html.escape(info.title[:200])}</b>"]
-    meta = [PLATFORM_TITLES.get(info.platform, info.platform)]
+    meta = [info.platform]
     if info.uploader:
         meta.append(html.escape(info.uploader[:60]))
     if info.duration:
@@ -130,8 +131,10 @@ async def on_link(message: Message) -> None:
     if message.from_user is None:  # посты от имени канала — игнорируем
         return
     text = message.text or message.caption
-    links = extract_links(text)
     in_group = message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+    # в группах реагируем только на известные видеоплощадки, иначе бот будет
+    # лезть в каждую ссылку в чате; в личке принимаем любую
+    links = extract_links(text, known_only=in_group)
 
     if not links:
         if not in_group:  # в группах молчим на посторонние сообщения
@@ -192,8 +195,10 @@ async def on_quality(callback: CallbackQuery) -> None:
     _pending.pop(token, None)
     info = pending.info
 
+    user_id = callback.from_user.id
+
     async def job() -> None:
-        await _run_download(message, info, quality)
+        await _run_download(message, info, quality, user_id)
 
     try:
         position = job_queue.submit(callback.from_user.id, job)
@@ -215,7 +220,7 @@ async def on_quality(callback: CallbackQuery) -> None:
 # Сама загрузка
 # --------------------------------------------------------------------------- #
 
-async def _run_download(message: Message, info: MediaInfo, quality: str) -> None:
+async def _run_download(message: Message, info: MediaInfo, quality: str, user_id: int) -> None:
     title = html.escape(info.title[:120])
     label = QUALITY_LABELS.get(quality, quality)
     try:
@@ -230,7 +235,7 @@ async def _run_download(message: Message, info: MediaInfo, quality: str) -> None
         action = ChatAction.UPLOAD_VOICE if result.is_audio else ChatAction.UPLOAD_VIDEO
         await message.bot.send_chat_action(message.chat.id, action)
 
-        caption_bits = [f"<b>{title}</b>", PLATFORM_TITLES.get(info.platform, info.platform)]
+        caption_bits = [f"<b>{title}</b>", info.platform]
         if result.compressed:
             caption_bits.append(f"сжато до {config.max_upload_mb} МБ")
         caption = "\n".join(caption_bits[:1]) + "\n" + " · ".join(caption_bits[1:])
@@ -253,6 +258,8 @@ async def _run_download(message: Message, info: MediaInfo, quality: str) -> None
         except Exception:  # noqa: BLE001
             await message.edit_text(f"✅ Готово: <b>{title}</b>")
 
+        await _maybe_nudge(message, user_id)
+
     except DownloadFailed as exc:
         await _fail(message, str(exc))
     except Exception as exc:  # noqa: BLE001
@@ -261,6 +268,24 @@ async def _run_download(message: Message, info: MediaInfo, quality: str) -> None
     finally:
         if result is not None:
             cleanup(result)
+
+
+async def _maybe_nudge(message: Message, user_id: int) -> None:
+    """Раз в config.donate_every загрузок — одна строчка про поддержку. Не чаще."""
+    if not config.donate_enabled or config.donate_every <= 0:
+        return
+    total = await storage.bump_downloads(user_id)
+    if total <= 0 or total % config.donate_every != 0:
+        return
+    try:
+        await message.bot.send_message(
+            message.chat.id,
+            "Бот бесплатный и держится на энтузиазме. Если он вам пригодился — "
+            "поддержать можно звёздами, но это строго по желанию.",
+            reply_markup=hint_keyboard(),
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _fail(message: Message, reason: str) -> None:

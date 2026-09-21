@@ -39,6 +39,12 @@ class Config:
     max_user_queue: int = _int("MAX_USER_QUEUE", 2)
     download_dir: Path = Path(os.getenv("DOWNLOAD_DIR", "/tmp/vdlbot"))
     cookies_file: str = os.getenv("COOKIES_FILE", "") or ""
+    proxy: str = os.getenv("PROXY", "") or ""
+    universal_mode: bool = (os.getenv("UNIVERSAL_MODE", "1") or "").strip().lower() in {"1", "true", "yes", "on"}
+    donate_enabled: bool = (os.getenv("DONATE_ENABLED", "1") or "").strip().lower() in {"1", "true", "yes", "on"}
+    donate_every: int = _int("DONATE_EVERY", 10)
+    db_path: Path = Path(os.getenv("DB_PATH", "/data/vdlbot.sqlite3"))
+    force_ipv4: bool = (os.getenv("FORCE_IPV4", "") or "").strip().lower() in {"1", "true", "yes", "on"}
     local_bot_api: str = os.getenv("LOCAL_BOT_API", "") or ""
     allowed_users: set[int] = field(default_factory=lambda: _ids("ALLOWED_USERS"))
 
@@ -50,6 +56,7 @@ class Config:
         if not self.bot_token:
             raise RuntimeError("BOT_TOKEN не задан. Скопируйте .env.example в .env и впишите токен.")
         self.download_dir.mkdir(parents=True, exist_ok=True)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         if self.cookies_file and not Path(self.cookies_file).exists():
             raise RuntimeError(f"COOKIES_FILE={self.cookies_file} не найден")
 

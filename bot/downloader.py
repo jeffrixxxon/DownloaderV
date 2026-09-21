@@ -11,6 +11,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
@@ -21,15 +22,57 @@ log = logging.getLogger(__name__)
 
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
-PLATFORM_PATTERNS: dict[str, re.Pattern[str]] = {
-    "youtube": re.compile(
-        r"^https?://(?:[\w-]+\.)*(?:youtube\.com|youtu\.be|youtube-nocookie\.com)/", re.I
-    ),
-    "instagram": re.compile(r"^https?://(?:[\w-]+\.)*instagram\.com/", re.I),
-    "coub": re.compile(r"^https?://(?:[\w-]+\.)*coub\.com/", re.I),
+# Известные площадки: только для красивого имени в карточке.
+# Скачивание не ограничено этим списком — см. UNIVERSAL_MODE.
+KNOWN_PLATFORMS: dict[str, str] = {
+    "youtube.com": "YouTube", "youtu.be": "YouTube", "youtube-nocookie.com": "YouTube",
+    "instagram.com": "Instagram",
+    "coub.com": "Coub",
+    "tiktok.com": "TikTok",
+    "vk.com": "VK", "vkvideo.ru": "VK Видео", "vk.ru": "VK",
+    "twitter.com": "X", "x.com": "X",
+    "reddit.com": "Reddit", "redd.it": "Reddit",
+    "rutube.ru": "Rutube",
+    "vimeo.com": "Vimeo",
+    "dailymotion.com": "Dailymotion", "dai.ly": "Dailymotion",
+    "twitch.tv": "Twitch",
+    "facebook.com": "Facebook", "fb.watch": "Facebook",
+    "ok.ru": "Одноклассники",
+    "pinterest.com": "Pinterest", "pin.it": "Pinterest",
+    "bilibili.com": "Bilibili",
+    "soundcloud.com": "SoundCloud",
+    "bandcamp.com": "Bandcamp",
+    "mixcloud.com": "Mixcloud",
+    "dzen.ru": "Дзен",
+    "likee.video": "Likee",
+    "t.me": "Telegram",
 }
 
-PLATFORM_TITLES = {"youtube": "YouTube", "instagram": "Instagram", "coub": "Coub"}
+# Домены, которые точно не про видео — не дёргаем yt-dlp впустую.
+IGNORED_DOMAINS = {
+    "google.com", "yandex.ru", "github.com", "wikipedia.org", "stackoverflow.com",
+    "telegram.org", "docs.google.com", "drive.google.com",
+}
+
+
+def _host(url: str) -> str:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def _registrable(host: str) -> str:
+    """Грубое приведение к домену второго уровня: m.youtube.com -> youtube.com."""
+    parts = host.split(".")
+    if len(parts) <= 2:
+        return host
+    # учитываем составные зоны вроде co.uk
+    if len(parts) >= 3 and parts[-2] in {"co", "com", "net", "org", "gov", "ac"} and len(parts[-1]) == 2:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
 
 
 class DownloadFailed(Exception):
@@ -63,25 +106,38 @@ class Result:
 # Разбор ссылок
 # --------------------------------------------------------------------------- #
 
-def extract_links(text: str | None) -> list[str]:
-    """Все поддерживаемые ссылки из текста, без дублей, в порядке появления."""
+def extract_links(text: str | None, *, known_only: bool = False) -> list[str]:
+    """Все пригодные ссылки из текста, без дублей, в порядке появления."""
     if not text:
         return []
     seen: set[str] = set()
     out: list[str] = []
     for raw in URL_RE.findall(text):
         url = raw.rstrip(").,!?»\"'")
-        if detect_platform(url) and url not in seen:
-            seen.add(url)
-            out.append(url)
+        if url in seen:
+            continue
+        domain = _registrable(_host(url))
+        if not domain or domain in IGNORED_DOMAINS:
+            continue
+        if domain not in KNOWN_PLATFORMS and (known_only or not config.universal_mode):
+            continue
+        seen.add(url)
+        out.append(url)
     return out
 
 
 def detect_platform(url: str) -> str | None:
-    for name, pattern in PLATFORM_PATTERNS.items():
-        if pattern.match(url):
-            return name
-    return None
+    """Имя площадки для карточки. Для незнакомых — просто домен."""
+    domain = _registrable(_host(url))
+    if not domain or domain in IGNORED_DOMAINS:
+        return None
+    if domain in KNOWN_PLATFORMS:
+        return KNOWN_PLATFORMS[domain]
+    return domain if config.universal_mode else None
+
+
+def is_known(url: str) -> bool:
+    return _registrable(_host(url)) in KNOWN_PLATFORMS
 
 
 # --------------------------------------------------------------------------- #
@@ -110,11 +166,15 @@ def _base_opts() -> dict:
     }
     if config.cookies_file:
         opts["cookiefile"] = config.cookies_file
+    if config.proxy:
+        opts["proxy"] = config.proxy
+    if config.force_ipv4:
+        opts["source_address"] = "0.0.0.0"
     return opts
 
 
 def _probe_sync(url: str) -> MediaInfo:
-    platform = detect_platform(url) or "unknown"
+    platform = detect_platform(url) or "ссылка"
     with YoutubeDL(_base_opts()) as ydl:
         info = ydl.extract_info(url, download=False)
     if info and info.get("_type") == "playlist":
@@ -346,7 +406,12 @@ def _humanize(message: str) -> str:
         ("confirm your age", "Видео с возрастным ограничением — нужны cookies авторизованного аккаунта."),
         ("rate-limit", "Площадка временно ограничила запросы. Попробуйте через несколько минут."),
         ("429", "Площадка временно ограничила запросы. Попробуйте через несколько минут."),
+        ("no address associated with hostname", "Сервер не смог определить IP площадки (DNS). Проверьте DNS контейнера или задайте PROXY в .env."),
+        ("name or service not known", "Сервер не смог определить IP площадки (DNS). Проверьте DNS контейнера или задайте PROXY в .env."),
+        ("errno -5", "Сервер не смог определить IP площадки (DNS)."),
         ("proxy", "Сервер не смог выйти в сеть (проблема с прокси или сетью)."),
+        ("network is unreachable", "С сервера нет доступа к площадке — сеть недоступна."),
+        ("connection refused", "Соединение отклонено — вероятно, мешает файрвол или прокси."),
         ("unable to connect", "Сервер не смог подключиться к площадке."),
         ("timed out", "Источник не ответил вовремя."),
         ("private", "Видео приватное."),
@@ -354,7 +419,8 @@ def _humanize(message: str) -> str:
         ("does not exist", "Такой страницы нет."),
         ("not available in your country", "Видео заблокировано в регионе сервера."),
         ("geo-restricted", "Видео заблокировано в регионе сервера."),
-        ("unsupported url", "Эта ссылка не поддерживается."),
+        ("unsupported url", "Эта площадка не поддерживается — yt-dlp не умеет её читать."),
+        ("no video formats", "На странице не нашлось видео."),
         ("is live", "Прямые трансляции скачивать нельзя."),
         ("403", "Площадка отклонила запрос (403). Возможно, нужны cookies или другой IP."),
         ("404", "Страница не найдена (404)."),

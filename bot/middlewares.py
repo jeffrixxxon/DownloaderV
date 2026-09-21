@@ -1,63 +1,102 @@
-"""Антиспам ибелый список пользователей."""
+"""Точка входа: запуск бота на long polling."""
 from __future__ import annotations
 
-import time
-from collections.abc import Awaitable, Callable
-from typing import Any
+import asyncio
+import logging
+import shutil
+import sys
 
-from aiogram import BaseMiddleware
-from aiogram.types import CallbackQuery, Message, TelegramObject, User
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.client.telegram import TelegramAPIServer
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.enums import ParseMode
+from aiogram.types import BotCommand
 
+from . import storage
 from .config import config
+from .donate import router as donate_router
+from .handlers import router
+from .middlewares import AccessMiddleware, ThrottleMiddleware
+from .queue import job_queue
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+)
+log = logging.getLogger("vdlbot")
 
 
-class AccessMiddleware(BaseMiddleware):
-    """Если задан ALLOWED_USERS — пускает только их."""
-
-    async def __call__(
-        self,
-        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
-        event: TelegramObject,
-        data: dict[str, Any],
-    ) -> Any:
-        if not config.allowed_users:
-            return await handler(event, data)
-        user: User | None = data.get("event_from_user")
-        if user and user.id in config.allowed_users:
-            return await handler(event, data)
-        if isinstance(event, CallbackQuery):
-            await event.answer("Нет доступа к этому боту.", show_alert=True)
-        return None
+def _check_binaries() -> None:
+    for binary in ("ffmpeg", "ffprobe"):
+        if shutil.which(binary) is None:
+            raise RuntimeError(f"{binary} не найден в PATH — без него бот не сможет обрабатывать видео.")
 
 
-class ThrottleMiddleware(BaseMiddleware):
-    """Не чаще одного «тяжёлого» действия раз в config.user_cooldown секунд."""
+async def _on_startup(bot: Bot) -> None:
+    await storage.init()
+    job_queue.start()
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="Начало работы"),
+            BotCommand(command="help", description="Справка"),
+            BotCommand(command="status", description="Очередь загрузок"),
+            *(
+                [BotCommand(command="donate", description="Поддержать автора")]
+                if config.donate_enabled
+                else []
+            ),
+        ]
+    )
+    me = await bot.get_me()
+    log.info("Бот @%s запущен", me.username)
 
-    def __init__(self) -> None:
-        self._last: dict[int, float] = {}
 
-    async def __call__(
-        self,
-        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
-        event: TelegramObject,
-        data: dict[str, Any],
-    ) -> Any:
-        user: User | None = data.get("event_from_user")
-        if user is None or config.user_cooldown <= 0:
-            return await handler(event, data)
+async def _on_shutdown() -> None:
+    await job_queue.stop()
+    log.info("Остановлен")
 
-        now = time.monotonic()
-        last = self._last.get(user.id, 0.0)
-        wait = config.user_cooldown - (now - last)
-        if wait > 0:
-            if isinstance(event, CallbackQuery):
-                await event.answer(f"Слишком часто. Подождите {wait:.0f} с.", show_alert=False)
-            elif isinstance(event, Message):
-                await event.reply(f"Слишком часто. Подождите {wait:.0f} с.")
-            return None
 
-        self._last[user.id] = now
-        if len(self._last) > 10_000:  # защита от роста словаря
-            cutoff = now - config.user_cooldown * 10
-            self._last = {uid: ts for uid, ts in self._last.items() if ts > cutoff}
-        return await handler(event, data)
+async def main() -> None:
+    config.validate()
+    _check_binaries()
+
+    session = None
+    if config.local_bot_api:
+        session = AiohttpSession(api=TelegramAPIServer.from_base(config.local_bot_api))
+        log.info("Использую локальный Bot API: %s", config.local_bot_api)
+
+    bot = Bot(
+        token=config.bot_token,
+        session=session,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+
+    dp = Dispatcher()
+    dp.message.middleware(AccessMiddleware())
+    dp.callback_query.middleware(AccessMiddleware())
+    # кулдаун вешаем только на входящие сообщения: нажатие кнопки качества идёт
+    # сразу после ссылки, и троттлить его было бы неудобно — там работает лимит очереди
+    dp.message.middleware(ThrottleMiddleware())
+    # донаты подключаем первым: у них свои типы апдейтов (платежи)
+    if config.donate_enabled:
+        dp.include_router(donate_router)
+    dp.include_router(router)
+    dp.startup.register(_on_startup)
+    dp.shutdown.register(_on_shutdown)
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    except RuntimeError as exc:
+        print(f"Ошибка запуска: {exc}", file=sys.stderr)
+        sys.exit(1)
